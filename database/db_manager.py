@@ -57,8 +57,9 @@ class DatabaseManager:
         sqlite_config = self.config.get('sqlite', {})
         db_path = sqlite_config.get('db_path', 'database/funding_rates.db')
         
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        # Only create directory if not using in-memory database
+        if db_path != ':memory:' and os.path.dirname(db_path):
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
         
         self.logger.info(f"Connecting to SQLite database at {db_path}")
         try:
@@ -130,6 +131,42 @@ class DatabaseManager:
                 ON funding_rates(symbol, funding_time)
                 ''')
                 
+                # Create price_data table
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS price_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    funding_time TIMESTAMP NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    granularity TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (symbol, funding_time) REFERENCES funding_rates(symbol, funding_time),
+                    UNIQUE(symbol, funding_time, timestamp, granularity)
+                )
+                ''')
+                
+                # Create indexes for price_data
+                cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_price_data_symbol_funding_time 
+                ON price_data(symbol, funding_time)
+                ''')
+                
+                cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_price_data_granularity 
+                ON price_data(granularity)
+                ''')
+                
+                cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_price_data_position 
+                ON price_data(position)
+                ''')
+                
             elif self.db_type == 'postgresql':
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS funding_rates (
@@ -147,6 +184,42 @@ class DatabaseManager:
                 cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_funding_rates_symbol_time 
                 ON funding_rates(symbol, funding_time)
+                ''')
+                
+                # Create price_data table
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS price_data (
+                    id SERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    funding_time TIMESTAMP NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    granularity TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (symbol, funding_time) REFERENCES funding_rates(symbol, funding_time),
+                    UNIQUE(symbol, funding_time, timestamp, granularity)
+                )
+                ''')
+                
+                # Create indexes for price_data
+                cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_price_data_symbol_funding_time 
+                ON price_data(symbol, funding_time)
+                ''')
+                
+                cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_price_data_granularity 
+                ON price_data(granularity)
+                ''')
+                
+                cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_price_data_position 
+                ON price_data(position)
                 ''')
             
             self.connection.commit()
@@ -351,6 +424,135 @@ class DatabaseManager:
             return results
         except Exception as e:
             self.logger.error(f"Error retrieving top funding rates: {e}")
+            raise
+        finally:
+            cursor.close()
+            self.release_connection(conn)
+            
+    def insert_price_data(self, price_data: List[Dict[str, Any]]) -> int:
+        """
+        Insert multiple price data records into the database.
+        
+        :param price_data: List of price data dictionaries
+        :type price_data: List[Dict[str, Any]]
+        :return: Number of records inserted
+        :rtype: int
+        """
+        if not price_data:
+            return 0
+            
+        self.logger.info(f"Inserting {len(price_data)} price data records into database")
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        inserted_count = 0
+        
+        try:
+            for data in price_data:
+                symbol = data.get('symbol')
+                funding_time = data.get('funding_time')
+                timestamp = data.get('timestamp')
+                granularity = data.get('granularity')
+                position = data.get('position')
+                open_price = float(data.get('open'))
+                high = float(data.get('high'))
+                low = float(data.get('low'))
+                close = float(data.get('close'))
+                volume = float(data.get('volume'))
+                
+                if self.db_type == 'sqlite':
+                    cursor.execute('''
+                    INSERT OR IGNORE INTO price_data 
+                    (symbol, funding_time, timestamp, granularity, position, open, high, low, close, volume)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (symbol, funding_time, timestamp, granularity, position, open_price, high, low, close, volume))
+                elif self.db_type == 'postgresql':
+                    cursor.execute('''
+                    INSERT INTO price_data 
+                    (symbol, funding_time, timestamp, granularity, position, open, high, low, close, volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, funding_time, timestamp, granularity) DO NOTHING
+                    ''', (symbol, funding_time, timestamp, granularity, position, open_price, high, low, close, volume))
+                
+                if cursor.rowcount > 0:
+                    inserted_count += 1
+            
+            conn.commit()
+            self.logger.info(f"Successfully inserted {inserted_count} price data records")
+            return inserted_count
+        except Exception as e:
+            self.logger.error(f"Error inserting price data: {e}")
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            self.release_connection(conn)
+    
+    def get_price_data(self, symbol: Optional[str] = None, 
+                      funding_time: Optional[datetime] = None,
+                      granularity: Optional[str] = None,
+                      position: Optional[str] = None,
+                      limit: int = 1000) -> List[Dict[str, Any]]:
+        """
+        Get price data from the database with optional filtering.
+        
+        :param symbol: Filter by symbol (optional)
+        :type symbol: Optional[str]
+        :param funding_time: Filter by funding time (optional)
+        :type funding_time: Optional[datetime]
+        :param granularity: Filter by granularity (e.g., '1m', '10m', '1h', '1d') (optional)
+        :type granularity: Optional[str]
+        :param position: Filter by position ('before' or 'after') (optional)
+        :type position: Optional[str]
+        :param limit: Maximum number of records to return
+        :type limit: int
+        :return: List of price data dictionaries
+        :rtype: List[Dict[str, Any]]
+        """
+        self.logger.info(f"Retrieving price data for symbol={symbol}, funding_time={funding_time}, granularity={granularity}, position={position}, limit={limit}")
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            query = "SELECT * FROM price_data WHERE 1=1"
+            params = []
+            
+            if symbol:
+                query += " AND symbol = ?"
+                params.append(symbol)
+                
+            if funding_time:
+                query += " AND funding_time = ?"
+                params.append(funding_time)
+                
+            if granularity:
+                query += " AND granularity = ?"
+                params.append(granularity)
+                
+            if position:
+                query += " AND position = ?"
+                params.append(position)
+                
+            query += " ORDER BY timestamp ASC LIMIT ?"
+            params.append(limit)
+            
+            # Adjust parameter placeholders for PostgreSQL
+            if self.db_type == 'postgresql':
+                query = query.replace('?', '%s')
+                
+            cursor.execute(query, params)
+            
+            if self.db_type == 'sqlite':
+                results = [dict(row) for row in cursor.fetchall()]
+            else:
+                columns = [desc[0] for desc in cursor.description]
+                results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                
+            self.logger.info(f"Retrieved {len(results)} price data records")
+            return results
+        except Exception as e:
+            self.logger.error(f"Error retrieving price data: {e}")
             raise
         finally:
             cursor.close()

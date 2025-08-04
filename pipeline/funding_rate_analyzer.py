@@ -14,7 +14,8 @@ and for regular updates to keep the database current.
 """
 
 import time
-from typing import List, Dict, Any, Optional
+import math
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from api.contract_client import MEXCContractClient
 from database.db_manager import DatabaseManager
@@ -46,6 +47,7 @@ class FundingRateAnalyzer:
     def collect_historical_data(self, symbols: Optional[List[str]] = None, days_back: Optional[int] = None) -> int:
         """
         Collect historical funding rate data for specified symbols and store in database.
+        Also collect price data for symbols with the highest absolute funding rates.
 
         If symbols is None, all available perpetual symbols will be fetched.
         If days_back is None, the value from config will be used.
@@ -104,12 +106,79 @@ class FundingRateAnalyzer:
             if i + batch_size < len(symbols):
                 time.sleep(1)
         
-        self.logger.info(f"Historical data collection completed. Total records: {total_records}")
+        self.logger.info(f"Historical funding rate data collection completed. Total records: {total_records}")
+        
+        # Collect historical price data for top funding rates
+        self.logger.info("Collecting historical price data for top funding rates")
+        
+        # Get current time
+        now = datetime.now(timezone.utc)
+        
+        # Calculate start time based on days_back
+        start_time = now - timedelta(days=days_back)
+        
+        # Get top funding rates from the specified period
+        top_n = self.config.get('funding', {}).get('top_n_symbols', 5)
+        top_rates = self.db_manager.get_top_funding_rates(
+            limit=top_n * 10,  # Get more to ensure we have enough unique symbols
+            start_time=start_time,
+            end_time=now
+        )
+        
+        if not top_rates:
+            self.logger.info("No funding rates found for the specified period")
+            return total_records
+            
+        # Get unique symbols and their highest absolute funding rates
+        symbol_highest_rates = {}
+        for rate in top_rates:
+            symbol = rate['symbol']
+            abs_rate = abs(float(rate['funding_rate']))
+            
+            if symbol not in symbol_highest_rates or abs_rate > abs(float(symbol_highest_rates[symbol]['funding_rate'])):
+                symbol_highest_rates[symbol] = rate
+                
+        # Sort by absolute funding rate and take top_n
+        sorted_rates = sorted(
+            symbol_highest_rates.values(), 
+            key=lambda x: abs(float(x['funding_rate'])), 
+            reverse=True
+        )[:top_n]
+        
+        self.logger.info(f"Found {len(sorted_rates)} top funding rates for historical price data collection")
+        
+        # Collect price data for each top funding rate
+        price_records = 0
+        for rate in sorted_rates:
+            symbol = rate['symbol']
+            funding_time = rate['funding_time']
+            
+            # Check if price data already exists for this funding event
+            existing_data = self.db_manager.get_price_data(
+                symbol=symbol,
+                funding_time=funding_time,
+                limit=1
+            )
+            
+            if existing_data:
+                self.logger.info(f"Price data already exists for {symbol} at {funding_time}")
+                continue
+                
+            # Fetch and store price data
+            records = self.fetch_and_store_price_data(symbol, funding_time)
+            price_records += records
+            self.logger.info(f"Collected {records} price data records for {symbol} at {funding_time}")
+            
+            # Add a small delay between symbols to avoid rate limiting
+            time.sleep(1)
+            
+        self.logger.info(f"Historical price data collection completed. Total price records: {price_records}")
         return total_records
 
     def update_funding_rates(self) -> int:
         """
-        Update the database with the latest funding rates for all symbols.
+        Update the database with the latest funding rates for all symbols and collect price data
+        for symbols with the highest absolute funding rates.
 
         :return: Number of new funding rate records added
         :rtype: int
@@ -127,6 +196,12 @@ class FundingRateAnalyzer:
         # Insert into database
         inserted = self.db_manager.insert_funding_rates(funding_rates)
         self.logger.info(f"Inserted {inserted} new funding rates")
+        
+        # Collect price data for top funding rates
+        if inserted > 0:
+            self.logger.info("Collecting price data for top funding rates")
+            price_records = self.collect_price_data_for_top_funding_rates()
+            self.logger.info(f"Collected {price_records} price data records for top funding rates")
         
         return inserted
 
@@ -186,6 +261,185 @@ class FundingRateAnalyzer:
         self.logger.info(f"Found {len(rates)} funding rates for {symbol}")
         return rates
 
+    def _fetch_price_data(self, symbol: str, funding_time: datetime, 
+                         granularity: str, position: str) -> List[Dict[str, Any]]:
+        """
+        Fetch price data for a specific symbol around a funding time with the specified granularity.
+        
+        :param symbol: Symbol to fetch price data for
+        :type symbol: str
+        :param funding_time: Funding time to fetch data around
+        :type funding_time: datetime
+        :param granularity: Data granularity ('1m', '10m', '1h', '1d')
+        :type granularity: str
+        :param position: Position relative to funding time ('before' or 'after')
+        :type position: str
+        :return: List of price data records
+        :rtype: List[Dict[str, Any]]
+        """
+        self.logger.info(f"Fetching {granularity} price data {position} funding time for {symbol}")
+        
+        # Convert funding_time to timestamp in seconds
+        funding_timestamp = int(funding_time.timestamp())
+        
+        # Define interval and time range based on granularity and position
+        interval_map = {
+            '1m': 'Min1',
+            '10m': 'Min10',
+            '1h': 'Hour1',
+            '1d': 'Day1'
+        }
+        
+        # Calculate start and end times based on config
+        if position == 'before':
+            if granularity == '1m':
+                minutes_before = self.config.get('funding', {}).get('time_windows', {}).get('one_min_minutes_before', 15)
+                start_time = funding_timestamp - (minutes_before * 60)
+                end_time = funding_timestamp
+            elif granularity == '10m':
+                hours_before = self.config.get('funding', {}).get('time_windows', {}).get('ten_min_hours_before', 2)
+                start_time = funding_timestamp - (hours_before * 3600)
+                end_time = funding_timestamp
+            elif granularity == '1h':
+                hours_back = self.config.get('funding', {}).get('time_windows', {}).get('hourly_hours_back', 8)
+                start_time = funding_timestamp - (hours_back * 3600)
+                end_time = funding_timestamp
+            elif granularity == '1d':
+                days_back = self.config.get('funding', {}).get('time_windows', {}).get('daily_days_back', 3)
+                start_time = funding_timestamp - (days_back * 86400)
+                end_time = funding_timestamp
+            else:
+                raise ValueError(f"Unsupported granularity: {granularity}")
+        elif position == 'after':
+            if granularity == '1m':
+                minutes_after = self.config.get('funding', {}).get('time_windows', {}).get('one_min_minutes_after', 15)
+                start_time = funding_timestamp
+                end_time = funding_timestamp + (minutes_after * 60)
+            else:
+                raise ValueError(f"Unsupported granularity for 'after' position: {granularity}")
+        else:
+            raise ValueError(f"Unsupported position: {position}")
+        
+        # Fetch OHLCV data
+        interval = interval_map.get(granularity)
+        if not interval:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+            
+        ohlcv_data = self.client.get_futures_ohlcv(
+            symbol=symbol,
+            interval=interval,
+            start=start_time,
+            end=end_time
+        )
+        
+        # Convert to price data format
+        price_data = []
+        for candle in ohlcv_data:
+            timestamp = datetime.fromtimestamp(candle[0] / 1000, tz=timezone.utc)
+            price_data.append({
+                'symbol': symbol,
+                'funding_time': funding_time,
+                'timestamp': timestamp,
+                'granularity': granularity,
+                'position': position,
+                'open': candle[1],
+                'high': candle[2],
+                'low': candle[3],
+                'close': candle[4],
+                'volume': candle[5]
+            })
+            
+        self.logger.info(f"Fetched {len(price_data)} {granularity} price data points {position} funding time for {symbol}")
+        return price_data
+        
+    def fetch_and_store_price_data(self, symbol: str, funding_time: datetime) -> int:
+        """
+        Fetch and store price data for a specific symbol around a funding time.
+        
+        :param symbol: Symbol to fetch price data for
+        :type symbol: str
+        :param funding_time: Funding time to fetch data around
+        :type funding_time: datetime
+        :return: Number of price data records stored
+        :rtype: int
+        """
+        self.logger.info(f"Fetching and storing price data for {symbol} around funding time {funding_time}")
+        
+        total_records = 0
+        
+        # Fetch and store price data before funding time with different granularities
+        for granularity in ['1m', '10m', '1h', '1d']:
+            price_data = self._fetch_price_data(symbol, funding_time, granularity, 'before')
+            if price_data:
+                inserted = self.db_manager.insert_price_data(price_data)
+                total_records += inserted
+                self.logger.info(f"Inserted {inserted} {granularity} price data records before funding time for {symbol}")
+        
+        # Fetch and store price data after funding time (1m only)
+        price_data = self._fetch_price_data(symbol, funding_time, '1m', 'after')
+        if price_data:
+            inserted = self.db_manager.insert_price_data(price_data)
+            total_records += inserted
+            self.logger.info(f"Inserted {inserted} 1m price data records after funding time for {symbol}")
+            
+        return total_records
+        
+    def collect_price_data_for_top_funding_rates(self) -> int:
+        """
+        Collect price data for symbols with the highest absolute funding rates.
+        
+        :return: Number of price data records collected and stored
+        :rtype: int
+        """
+        self.logger.info("Collecting price data for top funding rates")
+        
+        # Get current time
+        now = datetime.now(timezone.utc)
+        
+        # Get top funding rates from the last 24 hours
+        start_time = now - timedelta(hours=24)
+        top_n = self.config.get('funding', {}).get('top_n_symbols', 5)
+        
+        top_rates = self.db_manager.get_top_funding_rates(
+            limit=top_n,
+            start_time=start_time,
+            end_time=now
+        )
+        
+        if not top_rates:
+            self.logger.info("No funding rates found in the last 24 hours")
+            return 0
+            
+        self.logger.info(f"Found {len(top_rates)} top funding rates")
+        
+        # Collect price data for each top funding rate
+        total_records = 0
+        for rate in top_rates:
+            symbol = rate['symbol']
+            funding_time = rate['funding_time']
+            
+            # Check if price data already exists for this funding event
+            existing_data = self.db_manager.get_price_data(
+                symbol=symbol,
+                funding_time=funding_time,
+                limit=1
+            )
+            
+            if existing_data:
+                self.logger.info(f"Price data already exists for {symbol} at {funding_time}")
+                continue
+                
+            # Fetch and store price data
+            records = self.fetch_and_store_price_data(symbol, funding_time)
+            total_records += records
+            self.logger.info(f"Collected {records} price data records for {symbol} at {funding_time}")
+            
+            # Add a small delay between symbols to avoid rate limiting
+            time.sleep(1)
+            
+        self.logger.info(f"Price data collection completed. Total records: {total_records}")
+        return total_records
+        
     def analyze_funding_rate_patterns(self, days: int = 30) -> Dict[str, Any]:
         """
         Analyze funding rate patterns to identify trends and anomalies.
